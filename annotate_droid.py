@@ -1,53 +1,42 @@
 #!/usr/bin/env python3
 """
-Interactive manual annotation tool for DROID frames using SAM3.
+Interactive web-based annotation tool for DROID frames using SAM3.
 
-For each left_NNNNNN frame in a trajectory's stereo directories, shows the
-image and lets you draw bounding boxes. SAM3 generates a mask from each box.
-Accept or discard masks, annotate multiple objects per frame.
+Serves a Flask app - open in browser via SSH port forwarding:
+    ssh -L 5000:localhost:5000 user@server
+    conda run -n sam3 python annotate_droid.py ~/droid_processed_
+    # open http://localhost:5000
 
-Output: masks/mask_NNN_score_X.XXX.png per frame-side directory
-(same format as automatic SAM3 segmentation - compatible with SAM3D pipeline)
-
-Usage:
-    python annotate_droid.py /path/to/droid_processed/ENV/success/TRAJ
-
-Controls:
-    Left-click + drag  Draw bounding box for SAM3
-    A                  Accept current mask (saves it)
-    R                  Redo - discard current box/mask, draw again
-    N                  Next frame (done with this frame)
-    S                  Skip frame (no masks saved)
-    Q                  Quit
-
-Run with sam3 conda env:
-    conda run -n sam3 python annotate_droid.py <traj_dir>
+Controls (in browser):
+    Click + drag  Draw bounding box
+    Accept        Save current mask, draw another object
+    Redo          Discard current mask, redraw
+    Next          Done with this frame, move on
+    Skip          Skip frame without saving any masks
 """
 
 import argparse
+import base64
+import io
 import json
 import re
 import sys
 from pathlib import Path
 
 import cv2
-import matplotlib.patches as patches
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from flask import Flask, jsonify, render_template_string, request
 from PIL import Image
 
-# SAM3 imports - must be run from Gaia-DreMa root or with sam3 on PYTHONPATH
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))  # Gaia-DreMa root
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "sam3"))
 
-import sam3
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-
 # =============================================================================
-# SAM3 model (loaded once)
+# SAM3
 # =============================================================================
 
 _processor = None
@@ -65,257 +54,398 @@ def get_processor(device: str) -> Sam3Processor:
 
 
 def run_sam3_box(processor: Sam3Processor, image: np.ndarray, box_xyxy: np.ndarray):
-    """
-    Run SAM3 with a bounding box prompt.
-    box_xyxy: [x0, y0, x1, y1] in pixel coords.
-    Returns (mask H×W bool, score float) or (None, None).
-    """
     h, w = image.shape[:2]
     pil = Image.fromarray(image)
-
-    with torch.autocast("cuda" if processor.device == "cuda" else "cpu",
-                        dtype=torch.bfloat16 if processor.device == "cuda" else torch.float32):
+    dtype = torch.bfloat16 if processor.device == "cuda" else torch.float32
+    with torch.autocast(processor.device, dtype=dtype):
         state = processor.set_image(pil)
-
-        # Convert pixel box → normalized [cx, cy, w_norm, h_norm]
         x0, y0, x1, y1 = box_xyxy
-        cx = ((x0 + x1) / 2) / w
-        cy = ((y0 + y1) / 2) / h
-        bw = abs(x1 - x0) / w
-        bh = abs(y1 - y0) / h
-        box_norm = [cx, cy, bw, bh]
-
+        box_norm = [((x0+x1)/2)/w, ((y0+y1)/2)/h, abs(x1-x0)/w, abs(y1-y0)/h]
         state = processor.add_geometric_prompt(box_norm, label=True, state=state)
-
     masks = state.get("masks")
     scores = state.get("scores")
-
     if masks is None or len(masks) == 0:
         return None, None
-
-    # Take highest-scoring mask
     scores_np = scores.float().cpu().numpy()
     best = int(scores_np.argmax())
     mask = masks[best].squeeze().float().cpu().numpy() > 0.5
-    score = float(scores_np[best])
-    return mask, score
-
-
-# =============================================================================
-# Interactive annotation window
-# =============================================================================
-
-class AnnotationSession:
-    """Handles one frame's interactive annotation."""
-
-    def __init__(self, image: np.ndarray, processor: Sam3Processor, existing_masks: int = 0):
-        self.image = image
-        self.processor = processor
-        self.next_mask_idx = existing_masks  # continue from existing
-
-        self.accepted_masks = []   # list of (mask, score)
-        self.current_mask = None
-        self.current_score = None
-        self.current_box = None    # [x0, y0, x1, y1]
-
-        self._drag_start = None
-        self._rect_patch = None
-        self._mask_im = None
-
-        self.done = False   # True when user presses N (next frame)
-        self.skip = False   # True when user presses S (skip frame)
-
-    def _draw(self):
-        self.ax.cla()
-        self.ax.imshow(self.image)
-
-        # Draw all accepted masks
-        overlay = np.zeros((*self.image.shape[:2], 4), dtype=np.float32)
-        np.random.seed(42)
-        for i, (m, _) in enumerate(self.accepted_masks):
-            color = np.random.rand(3)
-            overlay[m, :3] = color
-            overlay[m, 3] = 0.45
-
-        if overlay.any():
-            self.ax.imshow(overlay)
-
-        # Draw current mask preview
-        if self.current_mask is not None:
-            preview = np.zeros((*self.image.shape[:2], 4), dtype=np.float32)
-            preview[self.current_mask] = [1, 1, 0, 0.5]  # yellow
-            self.ax.imshow(preview)
-
-        # Draw current box
-        if self.current_box is not None:
-            x0, y0, x1, y1 = self.current_box
-            rect = patches.Rectangle(
-                (min(x0, x1), min(y0, y1)),
-                abs(x1 - x0), abs(y1 - y0),
-                linewidth=2, edgecolor='yellow', facecolor='none'
-            )
-            self.ax.add_patch(rect)
-
-        n_acc = len(self.accepted_masks)
-        title = (f"Masks: {n_acc} accepted | "
-                 f"[A] accept  [R] redo  [N] next frame  [S] skip  [Q] quit")
-        if self.current_score is not None:
-            title = f"Score: {self.current_score:.3f} | " + title
-        self.ax.set_title(title, fontsize=9)
-        self.ax.axis('off')
-        self.fig.canvas.draw_idle()
-
-    def _on_press(self, event):
-        if event.inaxes != self.ax or event.button != 1:
-            return
-        self._drag_start = (event.xdata, event.ydata)
-
-    def _on_release(self, event):
-        if event.inaxes != self.ax or event.button != 1 or self._drag_start is None:
-            return
-        x0, y0 = self._drag_start
-        x1, y1 = event.xdata, event.ydata
-        self._drag_start = None
-
-        # Ignore tiny clicks (< 10px)
-        if abs(x1 - x0) < 10 or abs(y1 - y0) < 10:
-            return
-
-        self.current_box = [x0, y0, x1, y1]
-        self.current_mask = None
-        self.current_score = None
-        self._draw()
-
-        # Run SAM3
-        print(f"  Running SAM3 on box [{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}]...")
-        box = np.array([min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)])
-        mask, score = run_sam3_box(self.processor, self.image, box)
-        if mask is None:
-            print("  No mask returned.")
-        else:
-            print(f"  Mask score: {score:.3f}")
-            self.current_mask = mask
-            self.current_score = score
-        self._draw()
-
-    def _on_key(self, event):
-        key = event.key.lower() if event.key else ''
-
-        if key == 'a':  # Accept
-            if self.current_mask is not None:
-                self.accepted_masks.append((self.current_mask, self.current_score))
-                print(f"  Accepted mask {self.next_mask_idx + len(self.accepted_masks) - 1} "
-                      f"(score {self.current_score:.3f})")
-                self.current_mask = None
-                self.current_score = None
-                self.current_box = None
-                self._draw()
-            else:
-                print("  Nothing to accept - draw a box first.")
-
-        elif key == 'r':  # Redo
-            self.current_mask = None
-            self.current_score = None
-            self.current_box = None
-            self._draw()
-
-        elif key == 'n':  # Next frame
-            self.done = True
-            plt.close(self.fig)
-
-        elif key == 's':  # Skip frame
-            self.skip = True
-            self.done = True
-            plt.close(self.fig)
-
-        elif key == 'q':  # Quit
-            self.skip = True
-            self.done = True
-            self._quit = True
-            plt.close(self.fig)
-
-    def run(self) -> list:
-        """
-        Open window, let user annotate. Returns list of (mask, score) pairs.
-        Sets self.skip=True if frame should be skipped.
-        """
-        self._quit = False
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.canvas.mpl_connect('button_press_event', self._on_press)
-        self.fig.canvas.mpl_connect('button_release_event', self._on_release)
-        self.fig.canvas.mpl_connect('key_press_event', self._on_key)
-        self._draw()
-        plt.tight_layout()
-        plt.show()
-        return self.accepted_masks, getattr(self, '_quit', False)
-
-
-# =============================================================================
-# Mask saving
-# =============================================================================
-
-def save_masks(masks_scores: list, masks_dir: Path, start_idx: int):
-    """Save list of (mask, score) pairs to masks_dir/mask_NNN_score_X.XXX.png"""
-    masks_dir.mkdir(parents=True, exist_ok=True)
-    saved = []
-    for i, (mask, score) in enumerate(masks_scores):
-        idx = start_idx + i
-        filename = f"mask_{idx:03d}_score_{score:.3f}.png"
-        path = masks_dir / filename
-        mask_uint8 = (mask.astype(np.uint8)) * 255
-        cv2.imwrite(str(path), mask_uint8)
-        saved.append(str(path))
-        print(f"    Saved: {path.name}")
-    return saved
-
-
-def count_existing_masks(masks_dir: Path) -> int:
-    if not masks_dir.exists():
-        return 0
-    return len(list(masks_dir.glob("mask_*.png")))
+    return mask, float(scores_np[best])
 
 
 # =============================================================================
 # Frame discovery
 # =============================================================================
 
+def find_pointmap(traj_dir: Path, cam_name: str, frame_idx: str) -> Path:
+    depth_dir = traj_dir / "depth"
+    for p in [
+        depth_dir / cam_name / f"frame_{frame_idx}" / "pointmap.npy",
+        depth_dir / f"frame_{frame_idx}" / "pointmap.npy",
+    ]:
+        if p.exists():
+            return p
+    return None
+
+
 def find_frames(traj_dir: Path) -> list:
-    """
-    Find all left_NNNNNN frame-side directories in a trajectory's stereo dir.
-    Returns list of (frame_side_dir, image_path).
-    """
     frames = []
     stereo_dir = traj_dir / "stereo"
     if not stereo_dir.exists():
         return frames
-
     for cam_dir in sorted(stereo_dir.iterdir()):
         if not cam_dir.is_dir() or not cam_dir.name.endswith("-stereo"):
             continue
-        # Only external cameras (serial starts with 2 or 3)
         serial = cam_dir.name.replace("-stereo", "")
         if not serial or serial[0] not in ('2', '3'):
             continue
-
         for frame_side_dir in sorted(cam_dir.iterdir()):
             if not frame_side_dir.is_dir():
                 continue
             m = re.match(r'^left_(\d+)$', frame_side_dir.name)
             if not m:
                 continue
-
-            # Image is at stereo/<cam>-stereo/left_NNNNNN.png (sibling, not in subdir)
             frame_idx = m.group(1)
+            pointmap_path = find_pointmap(traj_dir, cam_dir.name, frame_idx)
+            if pointmap_path is None:
+                continue
             image_path = cam_dir / f"left_{frame_idx}.png"
             if not image_path.exists():
-                # Fall back: check inside dir
                 image_path = frame_side_dir / "left.png"
             if not image_path.exists():
                 continue
-
-            frames.append((frame_side_dir, image_path))
-
+            frames.append((frame_side_dir, image_path, pointmap_path))
     return frames
+
+
+def get_env(frame_side_dir: Path, base: Path) -> str:
+    try:
+        return frame_side_dir.relative_to(base).parts[0]
+    except Exception:
+        return ""
+
+
+def find_all_frames(base: Path, skip_envs: set = None) -> list:
+    all_frames = []
+    for env_dir in sorted(base.iterdir()):
+        if not env_dir.is_dir() or env_dir.name.startswith('.'):
+            continue
+        if skip_envs and env_dir.name in skip_envs:
+            continue
+        for outcome_dir in sorted(env_dir.iterdir()):
+            if not outcome_dir.is_dir():
+                continue
+            for traj_dir in sorted(outcome_dir.iterdir()):
+                if not traj_dir.is_dir():
+                    continue
+                all_frames.extend(find_frames(traj_dir))
+    return all_frames
+
+
+# =============================================================================
+# Mask helpers
+# =============================================================================
+
+def clear_masks(masks_dir: Path):
+    if masks_dir.exists():
+        for f in masks_dir.glob("mask_*.png"):
+            f.unlink()
+
+
+def save_masks(masks_scores: list, masks_dir: Path):
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    for i, (mask, score) in enumerate(masks_scores):
+        path = masks_dir / f"mask_{i:03d}_score_{score:.3f}.png"
+        cv2.imwrite(str(path), mask.astype(np.uint8) * 255)
+        print(f"  Saved: {path.name}")
+
+
+def image_to_b64(img_rgb: np.ndarray) -> str:
+    pil = Image.fromarray(img_rgb)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def overlay_masks(image: np.ndarray, accepted: list, current_mask=None) -> str:
+    viz = image.copy().astype(np.float32)
+    np.random.seed(42)
+    for i, (m, _) in enumerate(accepted):
+        color = (np.random.rand(3) * 155 + 100)
+        viz[m] = viz[m] * 0.5 + color * 0.5
+    if current_mask is not None:
+        viz[current_mask] = viz[current_mask] * 0.4 + np.array([255, 255, 0]) * 0.6
+    return image_to_b64(np.clip(viz, 0, 255).astype(np.uint8))
+
+
+# =============================================================================
+# Flask app
+# =============================================================================
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>DROID Annotator</title>
+<style>
+  body { margin: 0; background: #1a1a1a; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; }
+  #header { padding: 10px; font-size: 13px; color: #aaa; width: 100%; box-sizing: border-box; }
+  #progress { color: #7af; font-weight: bold; }
+  #frame-info { color: #fa7; margin-left: 20px; }
+  #canvas-wrap { position: relative; cursor: crosshair; }
+  #canvas { display: block; }
+  #overlay { position: absolute; top: 0; left: 0; pointer-events: none; }
+  #controls { padding: 10px; display: flex; gap: 10px; align-items: center; }
+  button { padding: 8px 20px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; font-family: monospace; }
+  #btn-accept { background: #2a7; color: #fff; }
+  #btn-redo   { background: #a72; color: #fff; }
+  #btn-next   { background: #27a; color: #fff; }
+  #btn-skip   { background: #555; color: #ccc; }
+  #status     { padding: 6px 12px; font-size: 13px; color: #ccc; }
+  #score      { color: #af7; font-weight: bold; }
+  #masks-list { font-size: 12px; color: #888; margin-left: 10px; }
+</style>
+</head>
+<body>
+<div id="header">
+  <span id="progress">Loading...</span>
+  <span id="frame-info"></span>
+</div>
+<div id="canvas-wrap">
+  <canvas id="canvas"></canvas>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="controls">
+  <button id="btn-accept" onclick="accept()">Accept</button>
+  <button id="btn-redo"   onclick="redo()">Redo</button>
+  <button id="btn-next"   onclick="next()">Next &#8594;</button>
+  <button id="btn-skip"   onclick="skip()">Skip</button>
+  <span id="status">Draw a box around an object</span>
+  <span id="masks-list"></span>
+</div>
+<script>
+const canvas  = document.getElementById('canvas');
+const overlay = document.getElementById('overlay');
+const ctx     = canvas.getContext('2d');
+const octx    = overlay.getContext('2d');
+
+let startX, startY, dragging = false;
+let currentBox = null;
+
+function setStatus(msg, score) {
+  document.getElementById('status').innerHTML =
+    score !== undefined ? `Score: <span id="score">${score.toFixed(3)}</span> &nbsp; ${msg}` : msg;
+}
+
+function loadFrame(data) {
+  document.getElementById('progress').textContent =
+    `Frame ${data.frame_idx + 1} / ${data.total}`;
+  document.getElementById('frame-info').textContent =
+    (data.env ? `[${data.env}]  ` : '') + data.rel_path;
+  document.getElementById('masks-list').textContent =
+    data.accepted_count > 0 ? `${data.accepted_count} mask(s) accepted` : '';
+  currentBox = null;
+
+  const img = new Image();
+  img.onload = () => {
+    canvas.width  = img.width;
+    canvas.height = img.height;
+    overlay.width  = img.width;
+    overlay.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (data.overlay_b64) {
+      const ov = new Image();
+      ov.onload = () => ctx.drawImage(ov, 0, 0);
+      ov.src = 'data:image/jpeg;base64,' + data.overlay_b64;
+    }
+  };
+  img.src = 'data:image/jpeg;base64,' + data.image_b64;
+  setStatus('Draw a box around an object');
+}
+
+canvas.addEventListener('mousedown', e => {
+  const r = canvas.getBoundingClientRect();
+  startX = e.clientX - r.left;
+  startY = e.clientY - r.top;
+  dragging = true;
+});
+
+canvas.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  octx.strokeStyle = '#ff0';
+  octx.lineWidth = 2;
+  octx.strokeRect(startX, startY, x - startX, y - startY);
+});
+
+canvas.addEventListener('mouseup', e => {
+  if (!dragging) return;
+  dragging = false;
+  const r = canvas.getBoundingClientRect();
+  const x = e.clientX - r.left, y = e.clientY - r.top;
+  if (Math.abs(x - startX) < 10 || Math.abs(y - startY) < 10) return;
+  currentBox = [Math.min(startX,x), Math.min(startY,y), Math.max(startX,x), Math.max(startY,y)];
+  setStatus('Running SAM3...');
+  fetch('/box', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({box: currentBox})})
+    .then(r => r.json()).then(data => {
+      if (data.error) { setStatus(data.error); return; }
+      const img = new Image();
+      img.onload = () => { ctx.drawImage(img, 0, 0); octx.clearRect(0,0,overlay.width,overlay.height); };
+      img.src = 'data:image/jpeg;base64,' + data.overlay_b64;
+      setStatus('Accept or redo', data.score);
+    });
+});
+
+function accept() {
+  fetch('/accept', {method:'POST'}).then(r=>r.json()).then(data => {
+    document.getElementById('masks-list').textContent =
+      `${data.accepted_count} mask(s) accepted`;
+    const img = new Image();
+    img.onload = () => { ctx.drawImage(img, 0, 0); octx.clearRect(0,0,overlay.width,overlay.height); };
+    img.src = 'data:image/jpeg;base64,' + data.overlay_b64;
+    setStatus('Draw another box, or click Next');
+  });
+}
+
+function redo() {
+  fetch('/redo', {method:'POST'}).then(r=>r.json()).then(data => {
+    const img = new Image();
+    img.onload = () => { ctx.drawImage(img, 0, 0); octx.clearRect(0,0,overlay.width,overlay.height); };
+    img.src = 'data:image/jpeg;base64,' + data.overlay_b64;
+    setStatus('Draw a box around an object');
+  });
+}
+
+function next() {
+  setStatus('Saving...');
+  fetch('/next', {method:'POST'}).then(r=>r.json()).then(data => {
+    if (data.done) { setStatus('All frames done!'); return; }
+    loadFrame(data);
+  });
+}
+
+function skip() {
+  fetch('/skip', {method:'POST'}).then(r=>r.json()).then(data => {
+    if (data.done) { setStatus('All frames done!'); return; }
+    loadFrame(data);
+  });
+}
+
+// Load first frame on page load
+fetch('/state').then(r=>r.json()).then(loadFrame);
+</script>
+</body>
+</html>
+"""
+
+
+def create_app(frames: list, root: Path, processor: Sam3Processor) -> Flask:
+    app = Flask(__name__)
+    app.config['frames'] = frames
+    app.config['root'] = root
+    app.config['processor'] = processor
+
+    state = {
+        'idx': 0,
+        'image': None,
+        'accepted': [],       # list of (mask, score)
+        'current_mask': None,
+        'current_score': None,
+    }
+
+    def load_frame(idx):
+        frame_side_dir, image_path, _ = frames[idx]
+        image = np.array(Image.open(image_path).convert("RGB"))
+        clear_masks(frame_side_dir / "masks")
+        # Mark this frame as manually visited (distinguishes from SAM3-generated masks)
+        marker = frame_side_dir / "annotated.json"
+        marker.write_text(json.dumps({"manually_annotated": True}))
+        state['image'] = image
+        state['accepted'] = []
+        state['current_mask'] = None
+        state['current_score'] = None
+
+    def frame_response(done=False):
+        if done:
+            return jsonify({'done': True})
+        idx = state['idx']
+        frame_side_dir, _, _ = frames[idx]
+        rel = frame_side_dir.relative_to(root)
+        env = rel.parts[0] if len(rel.parts) > 0 else ""
+        overlay_b64 = overlay_masks(state['image'], state['accepted'], state['current_mask'])
+        return jsonify({
+            'frame_idx': idx,
+            'total': len(frames),
+            'rel_path': str(rel),
+            'env': env,
+            'image_b64': image_to_b64(state['image']),
+            'overlay_b64': overlay_b64,
+            'accepted_count': len(state['accepted']),
+        })
+
+    @app.route('/')
+    def index():
+        return render_template_string(HTML)
+
+    @app.route('/state')
+    def get_state():
+        load_frame(state['idx'])
+        return frame_response()
+
+    @app.route('/box', methods=['POST'])
+    def box():
+        data = request.json
+        box = np.array(data['box'])
+        mask, score = run_sam3_box(processor, state['image'], box)
+        if mask is None:
+            return jsonify({'error': 'No mask found - try a different box'})
+        state['current_mask'] = mask
+        state['current_score'] = score
+        overlay_b64 = overlay_masks(state['image'], state['accepted'], mask)
+        return jsonify({'overlay_b64': overlay_b64, 'score': score})
+
+    @app.route('/accept', methods=['POST'])
+    def accept():
+        if state['current_mask'] is not None:
+            state['accepted'].append((state['current_mask'], state['current_score']))
+            state['current_mask'] = None
+            state['current_score'] = None
+        overlay_b64 = overlay_masks(state['image'], state['accepted'])
+        return jsonify({'overlay_b64': overlay_b64, 'accepted_count': len(state['accepted'])})
+
+    @app.route('/redo', methods=['POST'])
+    def redo():
+        state['current_mask'] = None
+        state['current_score'] = None
+        overlay_b64 = overlay_masks(state['image'], state['accepted'])
+        return jsonify({'overlay_b64': overlay_b64})
+
+    @app.route('/next', methods=['POST'])
+    def next_frame():
+        # Save accepted masks
+        frame_side_dir, _, _ = frames[state['idx']]
+        if state['accepted']:
+            save_masks(state['accepted'], frame_side_dir / "masks")
+            print(f"  Saved {len(state['accepted'])} mask(s) for {frame_side_dir.name}")
+        state['idx'] += 1
+        if state['idx'] >= len(frames):
+            return jsonify({'done': True})
+        load_frame(state['idx'])
+        return frame_response()
+
+    @app.route('/skip', methods=['POST'])
+    def skip():
+        print(f"  Skipped {frames[state['idx']][0].name}")
+        state['idx'] += 1
+        if state['idx'] >= len(frames):
+            return jsonify({'done': True})
+        load_frame(state['idx'])
+        return frame_response()
+
+    return app
 
 
 # =============================================================================
@@ -323,67 +453,41 @@ def find_frames(traj_dir: Path) -> list:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive SAM3 annotation for DROID frames")
-    parser.add_argument("traj_dir", help="Path to trajectory directory (env/outcome/traj)")
+    parser = argparse.ArgumentParser(description="Web-based SAM3 annotation for DROID frames")
+    parser.add_argument("input_dir", help="droid_processed directory or single trajectory directory")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--force", action="store_true",
-                        help="Re-annotate frames that already have masks")
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--skip-envs", nargs="+", default=[],
+                        help="Environments to skip (e.g. --skip-envs AUTOLab CLVR GuptaLab ILIAD)")
     args = parser.parse_args()
 
-    traj_dir = Path(args.traj_dir)
-    if not traj_dir.exists():
-        print(f"ERROR: {traj_dir} not found")
+    base = Path(args.input_dir)
+    if not base.exists():
+        print(f"ERROR: {base} not found")
         sys.exit(1)
 
-    frames = find_frames(traj_dir)
+    skip_envs = set(args.skip_envs)
+    if skip_envs:
+        print(f"Skipping environments: {', '.join(sorted(skip_envs))}")
+
+    if (base / "stereo").exists():
+        frames = find_frames(base)
+    else:
+        frames = find_all_frames(base, skip_envs=skip_envs)
+
     if not frames:
-        print(f"No left_* frames found in {traj_dir}/stereo/")
+        print(f"No frames with pointmaps found in {base}")
         sys.exit(1)
 
-    print(f"Found {len(frames)} frames to annotate in {traj_dir.name}")
-    print("Controls: drag=draw box | A=accept | R=redo | N=next frame | S=skip | Q=quit\n")
+    print(f"Found {len(frames)} frames with pointmaps")
 
     processor = get_processor(args.device)
 
-    total_saved = 0
-    quit_requested = False
+    app = create_app(frames, base, processor)
 
-    for i, (frame_side_dir, image_path) in enumerate(frames):
-        rel = frame_side_dir.relative_to(traj_dir)
-        masks_dir = frame_side_dir / "masks"
-        existing = count_existing_masks(masks_dir)
-
-        if existing > 0 and not args.force:
-            print(f"[{i+1}/{len(frames)}] {rel}: skipping ({existing} masks exist, use --force to redo)")
-            continue
-
-        print(f"[{i+1}/{len(frames)}] {rel}  (image: {image_path.name})")
-
-        image = np.array(Image.open(image_path).convert("RGB"))
-
-        session = AnnotationSession(image, processor, existing_masks=existing)
-        accepted, quit_requested = session.run()
-
-        if quit_requested:
-            print("Quitting.")
-            break
-
-        if session.skip:
-            print(f"  Skipped.")
-            continue
-
-        if accepted:
-            saved = save_masks(accepted, masks_dir, start_idx=existing)
-            total_saved += len(saved)
-            print(f"  Saved {len(saved)} mask(s).")
-        else:
-            print(f"  No masks saved.")
-
-    print(f"\nDone. Total masks saved: {total_saved}")
-    print(f"\nNext steps:")
-    print(f"  1. rsync masks to cluster:")
-    print(f"     rsync -av {traj_dir}/ cluster:/ivi/xfs/lschune/droid_processed/.../")
-    print(f"  2. Run SAM3D reconstruction on cluster")
+    print(f"\nOpen in browser: http://localhost:{args.port}")
+    print(f"(via SSH: ssh -L {args.port}:localhost:{args.port} user@server)\n")
+    app.run(host='0.0.0.0', port=args.port, debug=False)
 
 
 if __name__ == "__main__":
